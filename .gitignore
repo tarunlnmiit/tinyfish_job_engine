@@ -13,3 +13,4 @@ graphify-out/
 output/
 state/
 .DS_Store
+.claude/
