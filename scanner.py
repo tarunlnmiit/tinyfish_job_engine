@@ -1,0 +1,329 @@
+import json
+import re
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+from tinyfish import TinyFish, RateLimitError
+from openai import OpenAI
+
+from notifier import send_whatsapp
+from llm_utils import chat_with_fallback
+
+STATE_FILE = Path("state/seen_jobs.json")
+LAST_SCAN_FILE = Path("state/last_scan.json")
+RESUME_FILE = Path("resume/CV_Tarun_Gupta_EU.md")
+
+# Matches individual job postings by URL pattern
+JOB_URL_RE = re.compile(
+    r"/(job|jobs|opening|openings|position|positions|vacancy|vacancies|role|roles|apply)"
+    r"/[a-zA-Z0-9_%@.-]{4,}",
+    re.IGNORECASE,
+)
+# Lever: job UUID is 36 chars (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx)
+# Greenhouse: /jobs/12345 (numeric)
+# Ashby: /jobs/uuid
+ATS_JOB_RE = re.compile(
+    r"(greenhouse\.io/.+/jobs/\d+"
+    r"|lever\.co/[^/]+/[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}"
+    r"|myworkdayjobs\.com/[^?#]+"
+    r"|smartrecruiters\.com/[^/]+/[A-Z0-9]+"
+    r"|ashbyhq\.com/[^/]+/[a-f0-9-]{32,})",
+    re.IGNORECASE,
+)
+# ATS listing pages (company-level, not individual jobs) — need one more hop
+ATS_LISTING_RE = re.compile(
+    r"^https?://(jobs\.lever\.co|boards\.greenhouse\.io|apply\.workable\.com"
+    r"|jobs\.smartrecruiters\.com)/[^/?#]+/?(\?.*)?$",
+    re.IGNORECASE,
+)
+
+SEARCH_QUERY = (
+    'site:{domain} (senior OR staff OR principal OR lead) '
+    '("data scientist" OR "ML engineer" OR "machine learning engineer" '
+    'OR "AI engineer" OR MLOps OR "deep learning")'
+)
+
+SCORE_PROMPT = """You are evaluating job postings for a senior ML/AI engineer. Output ONLY a JSON array, no other text.
+
+CANDIDATE:
+- Tarun Gupta, 10+ YOE, Senior/Staff Data Scientist / ML / AI Engineer
+- Stack: Python, LLMs, RAG, LangChain, Snowflake, AWS, Azure OpenAI, Computer Vision, MLOps, Spark, FastAPI, Streamlit
+- Seeking: EU relocation (lived in Germany — Magdeburg, Hamburg), NZ relocation, or India remote
+- NOT suitable: junior roles, pure SWE with no ML, non-technical management
+
+RESUME SUMMARY:
+{resume_summary}
+
+JOBS TO SCORE:
+{jobs_text}
+
+For each job output:
+{{
+  "job_number": 1,
+  "score": 0-100,
+  "title": "extracted job title",
+  "stack": "key tech from JD (comma-separated, max 6 items)",
+  "location_remote": "location + remote policy",
+  "reason": "one sentence why this fits or doesn't fit Tarun",
+  "worth_applying": true/false
+}}
+
+Scoring: 80-100 near-perfect; 60-79 good fit; 40-59 partial; <40 poor.
+Set worth_applying=true only if score >= 55.
+Include ALL jobs. Output ONLY the JSON array."""
+
+
+def is_job_url(url: str) -> bool:
+    return bool(JOB_URL_RE.search(url)) or bool(ATS_JOB_RE.search(url))
+
+
+def is_ats_listing(url: str) -> bool:
+    return bool(ATS_LISTING_RE.match(url))
+
+
+def load_state() -> dict:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {"seen_urls": []}
+
+
+def save_state(state: dict) -> None:
+    STATE_FILE.parent.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+_FETCH_URL_DELAY = 2.5  # seconds per URL to stay under 25 URLs/min
+
+
+def _fetch_with_ratelimit(
+    tf: TinyFish, urls: list[str], **kwargs
+):
+    """Single fetch call with rate-limit retry."""
+    for attempt in range(2):
+        try:
+            resp = tf.fetch.get_contents(urls, **kwargs)
+            time.sleep(len(urls) * _FETCH_URL_DELAY)
+            return resp
+        except RateLimitError:
+            print(f"  fetch rate-limited, waiting 65s...")
+            time.sleep(65)
+        except Exception as e:
+            print(f"  fetch error: {e}")
+            time.sleep(len(urls) * _FETCH_URL_DELAY)
+            return None
+    return None
+
+
+def _fetch_links(tf: TinyFish, urls: list[str]) -> dict[str, list[str]]:
+    """Batch fetch URLs, return {url: [links]} mapping."""
+    result = {}
+    for i in range(0, len(urls), 10):
+        batch = urls[i : i + 10]
+        resp = _fetch_with_ratelimit(tf, batch, format="markdown", links=True)
+        if resp:
+            for r in resp.results:
+                result[r.url] = r.links
+    return result
+
+
+def discover_job_urls(
+    tf: TinyFish, company: dict, seen_urls: set
+) -> list[dict]:
+    """
+    Multi-hop discovery:
+    1. Fetch careers page → extract direct job links + ATS listing pages
+    2. Fetch ATS listing pages → extract individual job links
+    3. Search for additional indexed job pages
+    """
+    found_urls: set[str] = set()
+
+    # --- Step 1: Fetch careers page ---
+    resp = _fetch_with_ratelimit(tf, [company["careers_url"]], format="markdown", links=True)
+    if resp:
+        if resp.results:
+            links = resp.results[0].links
+            direct = [l for l in links if is_job_url(l) and l not in seen_urls]
+            ats_pages = list({l for l in links if is_ats_listing(l)})
+            found_urls.update(direct)
+
+            # --- Step 2: Expand ATS listing pages ---
+            if ats_pages:
+                ats_link_map = _fetch_links(tf, ats_pages[:5])
+                for page_links in ats_link_map.values():
+                    for l in page_links:
+                        if is_job_url(l) and l not in seen_urls:
+                            found_urls.add(l)
+
+    # --- Step 3: Search for indexed job pages (rate-limited: 5/min) ---
+    query = SEARCH_QUERY.format(domain=company["search_domain"])
+    for attempt in range(2):
+        try:
+            resp = tf.search.query(query, language="en")
+            for r in resp.results:
+                if is_job_url(r.url) and r.url not in seen_urls:
+                    found_urls.add(r.url)
+            time.sleep(13)  # stay under 5 req/min
+            break
+        except RateLimitError:
+            print(f"  search rate-limited ({company['name']}), waiting 60s...")
+            time.sleep(62)
+        except Exception as e:
+            print(f"  search error ({company['name']}): {e}")
+            time.sleep(13)
+            break
+
+    new = [
+        {
+            "url": u,
+            "title": u.split("/")[-1].replace("-", " ").title(),
+            "snippet": "",
+            "company": company["name"],
+            "location": company["location"],
+            "region": company["region"],
+        }
+        for u in found_urls
+    ]
+    return new
+
+
+def fetch_job_details(tf: TinyFish, jobs: list[dict]) -> list[dict]:
+    enriched = []
+    for i in range(0, len(jobs), 10):
+        batch = jobs[i : i + 10]
+        urls = [j["url"] for j in batch]
+        resp = _fetch_with_ratelimit(tf, urls, format="markdown")
+        if not resp:
+            enriched.extend(batch)
+            continue
+        fetched = {r.url: r for r in resp.results}
+        for job in batch:
+            r = fetched.get(job["url"])
+            if r and r.text:
+                job["content"] = r.text[:3000]
+                job["title"] = r.title or job["title"]
+            enriched.append(job)
+    return enriched
+
+
+def score_jobs(llm: OpenAI, jobs: list[dict], resume: str, config: dict) -> list[dict]:
+    if not jobs:
+        return []
+
+    jobs_text = "\n\n".join(
+        f"JOB {i + 1}:\nCompany: {j['company']} | Location: {j['location']}\n"
+        f"Title: {j['title']}\nURL: {j['url']}\n"
+        f"Content:\n{j.get('content', j.get('snippet', ''))[:1500]}"
+        for i, j in enumerate(jobs)
+    )
+
+    prompt = SCORE_PROMPT.format(
+        resume_summary=resume[:2500],
+        jobs_text=jobs_text,
+    )
+
+    try:
+        raw = chat_with_fallback(
+            llm, config,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        start, end = raw.find("["), raw.rfind("]") + 1
+        if start == -1:
+            return []
+        scored = json.loads(raw[start:end])
+    except Exception as e:
+        print(f"  scoring error: {e}")
+        return []
+
+    results = []
+    for item in scored:
+        if not item.get("worth_applying"):
+            continue
+        idx = item.get("job_number", 0) - 1
+        if 0 <= idx < len(jobs):
+            job = jobs[idx].copy()
+            job.update(
+                {
+                    "score": item.get("score", 0),
+                    "extracted_title": item.get("title", job["title"]),
+                    "stack": item.get("stack", ""),
+                    "location_remote": item.get("location_remote", job["location"]),
+                    "reason": item.get("reason", ""),
+                }
+            )
+            results.append(job)
+
+    return sorted(results, key=lambda x: x["score"], reverse=True)
+
+
+def format_whatsapp_message(top_jobs: list[dict], date_str: str) -> str:
+    lines = [f"*Job Hunt — {date_str}*", f"_{len(top_jobs)} matches found_\n"]
+    for i, job in enumerate(top_jobs, 1):
+        lines.append(
+            f"*#{i}* | {job['company']} | {job.get('extracted_title', job['title'])}\n"
+            f"📍 {job.get('location_remote', job['location'])}\n"
+            f"🔧 {job.get('stack', 'N/A')}\n"
+            f"✅ {job.get('reason', '')}\n"
+            f"🔗 {job['url']}\n"
+        )
+    lines.append('Reply "apply to #N" to draft application.')
+    return "\n".join(lines)
+
+
+def run_scan(config: dict, companies: list[dict]) -> None:
+    tf = TinyFish(api_key=config["tinyfish_api_key"])
+    llm = OpenAI(
+        api_key=config["openrouter_api_key"],
+        base_url="https://openrouter.ai/api/v1",
+    )
+    resume = RESUME_FILE.read_text()
+    min_score = config.get("candidate", {}).get("min_score", 55)
+    top_n = config.get("candidate", {}).get("top_n", 5)
+
+    state = load_state()
+    seen_urls: set = set(state.get("seen_urls", []))
+    all_new_jobs: list[dict] = []
+
+    for company in companies:
+        print(f"Scanning {company['name']}...")
+        new_jobs = discover_job_urls(tf, company, seen_urls)
+        if new_jobs:
+            print(f"  {len(new_jobs)} new job URLs")
+            all_new_jobs.extend(new_jobs)
+            seen_urls.update(j["url"] for j in new_jobs)
+
+    print(f"\n{len(all_new_jobs)} new job URLs total. Fetching full JDs...")
+    all_new_jobs = fetch_job_details(tf, all_new_jobs)
+
+    print("Scoring with LLM...")
+    top_jobs: list[dict] = []
+    for i in range(0, len(all_new_jobs), 10):
+        batch = all_new_jobs[i : i + 10]
+        scored = score_jobs(llm, batch, resume, config)
+        top_jobs.extend(scored)
+
+    top_jobs = sorted(top_jobs, key=lambda x: x["score"], reverse=True)
+    top_jobs = [j for j in top_jobs if j["score"] >= min_score][:top_n]
+
+    state["seen_urls"] = list(seen_urls)
+    state["last_scan"] = datetime.now(timezone.utc).isoformat()
+    save_state(state)
+
+    LAST_SCAN_FILE.parent.mkdir(exist_ok=True)
+    LAST_SCAN_FILE.write_text(json.dumps(top_jobs, indent=2))
+
+    date_str = datetime.now().strftime("%d %b %Y")
+
+    if not top_jobs:
+        print("No matching jobs found today.")
+        msg = f"*Job Hunt — {date_str}*\nNo new matches today."
+    else:
+        msg = format_whatsapp_message(top_jobs, date_str)
+        print("\n" + msg)
+
+    wa = config.get("whatsapp", {})
+    if wa.get("phone") and wa.get("apikey") and "XXXXXXXXXX" not in wa["phone"]:
+        send_whatsapp(wa["phone"], wa["apikey"], msg)
+    else:
+        print("\n[WhatsApp not configured — add your phone number to config.json]")
