@@ -7,12 +7,12 @@ from pathlib import Path
 from tinyfish import TinyFish, RateLimitError
 from openai import OpenAI
 
-from notifier import send_whatsapp
+from notifier import send_telegram
 from llm_utils import chat_with_fallback
 
 STATE_FILE = Path("state/seen_jobs.json")
 LAST_SCAN_FILE = Path("state/last_scan.json")
-RESUME_FILE = Path("resume/CV_Tarun_Gupta_EU.md")
+# RESUME_FILE is now loaded from config in run_scan
 
 # Matches individual job postings by URL pattern
 JOB_URL_RE = re.compile(
@@ -257,15 +257,15 @@ def score_jobs(llm: OpenAI, jobs: list[dict], resume: str, config: dict) -> list
     return sorted(results, key=lambda x: x["score"], reverse=True)
 
 
-def format_whatsapp_message(top_jobs: list[dict], date_str: str) -> str:
-    lines = [f"*Job Hunt — {date_str}*", f"_{len(top_jobs)} matches found_\n"]
+def format_telegram_message(top_jobs: list[dict], date_str: str) -> str:
+    lines = [f"<b>Job Hunt — {date_str}</b>", f"<i>{len(top_jobs)} matches found</i>\n"]
     for i, job in enumerate(top_jobs, 1):
         lines.append(
-            f"*#{i}* | {job['company']} | {job.get('extracted_title', job['title'])}\n"
+            f"<b>#{i}</b> | {job['company']} | {job.get('extracted_title', job['title'])}\n"
             f"📍 {job.get('location_remote', job['location'])}\n"
             f"🔧 {job.get('stack', 'N/A')}\n"
             f"✅ {job.get('reason', '')}\n"
-            f"🔗 {job['url']}\n"
+            f"<a href=\"{job['url']}\">Apply</a>\n"
         )
     lines.append('Reply "apply to #N" to draft application.')
     return "\n".join(lines)
@@ -277,7 +277,8 @@ def run_scan(config: dict, companies: list[dict]) -> None:
         api_key=config["openrouter_api_key"],
         base_url="https://openrouter.ai/api/v1",
     )
-    resume = RESUME_FILE.read_text()
+    resume_path = Path(config.get("candidate", {}).get("resume_path", "resume/CV_Tarun_Gupta_EU.md"))
+    resume = resume_path.read_text()
     min_score = config.get("candidate", {}).get("min_score", 55)
     top_n = config.get("candidate", {}).get("top_n", 5)
 
@@ -317,13 +318,13 @@ def run_scan(config: dict, companies: list[dict]) -> None:
 
     if not top_jobs:
         print("No matching jobs found today.")
-        msg = f"*Job Hunt — {date_str}*\nNo new matches today."
+        msg = f"<b>Job Hunt — {date_str}</b>\nNo new matches today."
     else:
-        msg = format_whatsapp_message(top_jobs, date_str)
+        msg = format_telegram_message(top_jobs, date_str)
         print("\n" + msg)
 
-    wa = config.get("whatsapp", {})
-    if wa.get("phone") and wa.get("apikey") and "XXXXXXXXXX" not in wa["phone"]:
-        send_whatsapp(wa["phone"], wa["apikey"], msg)
+    tg = config.get("telegram", {})
+    if tg.get("token") and tg.get("chat_id"):
+        send_telegram(tg["token"], tg["chat_id"], msg)
     else:
-        print("\n[WhatsApp not configured — add your phone number to config.json]")
+        print("\n[Telegram not configured — add token and chat_id to config.json]")
