@@ -8,7 +8,7 @@ from openai import OpenAI
 
 from llm_utils import chat_with_fallback
 
-RESUME_FILE = Path("resume/CV_Tarun_Gupta_EU.md")
+# RESUME_FILE is now loaded from config in draft_application
 LAST_SCAN_FILE = Path("state/last_scan.json")
 OUTPUT_DIR = Path("output")
 
@@ -40,7 +40,8 @@ def draft_application(config: dict, job_ref: str) -> None:
         api_key=config["openrouter_api_key"],
         base_url="https://openrouter.ai/api/v1",
     )
-    resume = RESUME_FILE.read_text()
+    resume_path = Path(config.get("candidate", {}).get("resume_path", "resume/CV_Tarun_Gupta_EU.md"))
+    resume = resume_path.read_text()
 
     job_url, company_slug = _resolve_job(job_ref)
 
