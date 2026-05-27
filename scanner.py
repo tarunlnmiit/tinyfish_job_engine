@@ -272,11 +272,21 @@ def format_telegram_message(top_jobs: list[dict], date_str: str) -> str:
 
 
 def run_scan(config: dict, companies: list[dict]) -> None:
-    tf = TinyFish(api_key=config["tinyfish_api_key"])
-    llm = OpenAI(
-        api_key=config["openrouter_api_key"],
-        base_url="https://openrouter.ai/api/v1",
-    )
+    try:
+        tf = TinyFish(api_key=config["tinyfish_api_key"])
+    except Exception as e:
+        print(f"TinyFish init error: {e}")
+        return
+
+    try:
+        llm = OpenAI(
+            api_key=config["openrouter_api_key"],
+            base_url="https://openrouter.ai/api/v1",
+        )
+    except Exception as e:
+        print(f"OpenRouter init error: {e}")
+        return
+
     resume_path = Path(config.get("candidate", {}).get("resume_path", "resume/CV_Tarun_Gupta_EU.md"))
     resume = resume_path.read_text()
     min_score = config.get("candidate", {}).get("min_score", 55)
@@ -284,37 +294,61 @@ def run_scan(config: dict, companies: list[dict]) -> None:
 
     state = load_state()
     seen_urls: set = set(state.get("seen_urls", []))
-    all_new_jobs: list[dict] = []
+    all_scored_jobs: list[dict] = []
+    errors: list[str] = []
 
     for company in companies:
         print(f"Scanning {company['name']}...")
-        new_jobs = discover_job_urls(tf, company, seen_urls)
-        if new_jobs:
-            print(f"  {len(new_jobs)} new job URLs")
-            all_new_jobs.extend(new_jobs)
+        try:
+            new_jobs = discover_job_urls(tf, company, seen_urls)
+            if not new_jobs:
+                print(f"  No new jobs found")
+                continue
+
+            print(f"  {len(new_jobs)} new job URLs. Fetching details...")
+            new_jobs = fetch_job_details(tf, new_jobs)
             seen_urls.update(j["url"] for j in new_jobs)
 
-    print(f"\n{len(all_new_jobs)} new job URLs total. Fetching full JDs...")
-    all_new_jobs = fetch_job_details(tf, all_new_jobs)
+            print(f"  Scoring jobs...")
+            scored: list[dict] = []
+            try:
+                for i in range(0, len(new_jobs), 10):
+                    batch = new_jobs[i : i + 10]
+                    batch_scored = score_jobs(llm, batch, resume, config)
+                    scored.extend(batch_scored)
+            except Exception as score_err:
+                print(f"  Scoring failed: {score_err}")
+                msg = f"⚠️ Scoring failed for {company['name']}: {score_err}"
+                errors.append(msg)
+                print(f"  Fallback: saving unscored jobs from {company['name']}")
+                scored = new_jobs
 
-    print("Scoring with LLM...")
-    top_jobs: list[dict] = []
-    for i in range(0, len(all_new_jobs), 10):
-        batch = all_new_jobs[i : i + 10]
-        scored = score_jobs(llm, batch, resume, config)
-        top_jobs.extend(scored)
+            if scored:
+                all_scored_jobs.extend(scored)
+                print(f"  Saved {len(scored)} jobs from {company['name']}")
 
-    top_jobs = sorted(top_jobs, key=lambda x: x["score"], reverse=True)
-    top_jobs = [j for j in top_jobs if j["score"] >= min_score][:top_n]
+        except Exception as company_err:
+            msg = f"❌ {company['name']}: {company_err}"
+            errors.append(msg)
+            print(f"  Company scan failed: {company_err}")
+            continue
 
     state["seen_urls"] = list(seen_urls)
     state["last_scan"] = datetime.now(timezone.utc).isoformat()
     save_state(state)
 
+    top_jobs = sorted([j for j in all_scored_jobs if j.get("score", 0) >= min_score],
+                      key=lambda x: x.get("score", 0), reverse=True)[:top_n]
+
     LAST_SCAN_FILE.parent.mkdir(exist_ok=True)
-    LAST_SCAN_FILE.write_text(json.dumps(top_jobs, indent=2))
+    LAST_SCAN_FILE.write_text(json.dumps(all_scored_jobs, indent=2))
 
     date_str = datetime.now().strftime("%d %b %Y")
+    tg = config.get("telegram", {})
+
+    if errors and tg.get("token") and tg.get("chat_id"):
+        error_msg = f"<b>Job Hunt Errors — {date_str}</b>\n" + "\n".join(errors)
+        send_telegram(tg["token"], tg["chat_id"], error_msg)
 
     if not top_jobs:
         print("No matching jobs found today.")
@@ -323,7 +357,6 @@ def run_scan(config: dict, companies: list[dict]) -> None:
         msg = format_telegram_message(top_jobs, date_str)
         print("\n" + msg)
 
-    tg = config.get("telegram", {})
     if tg.get("token") and tg.get("chat_id"):
         send_telegram(tg["token"], tg["chat_id"], msg)
     else:
