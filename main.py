@@ -4,10 +4,14 @@ Usage:
   python main.py scan              — run daily job scan
   python main.py draft #1          — draft application for job #1 from last scan
   python main.py draft https://... — draft application for a specific URL
+  python main.py export            — export last scan to CSV (output/jobs_YYYY-MM-DD.csv)
+  python main.py export --min 60   — export only jobs with score >= 60
 """
+import csv
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -74,6 +78,51 @@ def load_companies() -> list:
     return json.loads(p.read_text())
 
 
+LAST_SCAN_FILE = Path("state/last_scan.json")
+
+EXPORT_FIELDS = [
+    "Company", "Role", "Location", "Application URL",
+    "Score (%)", "Stack", "Region", "Reason", "Worth Applying",
+]
+
+
+def export_jobs(min_score: int = 0) -> None:
+    if not LAST_SCAN_FILE.exists():
+        sys.exit("No scan found. Run: python main.py scan")
+
+    jobs: list[dict] = json.loads(LAST_SCAN_FILE.read_text())
+    filtered = [j for j in jobs if j.get("score", 0) >= min_score]
+
+    if not filtered:
+        print(f"No jobs with score >= {min_score}")
+        return
+
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    out_path = Path("output") / f"jobs_{date_str}.csv"
+    out_path.parent.mkdir(exist_ok=True)
+
+    with out_path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=EXPORT_FIELDS)
+        writer.writeheader()
+        for j in filtered:
+            worth = j.get("worth_applying")
+            writer.writerow({
+                "Company": j.get("company", ""),
+                "Role": j.get("extracted_title") or j.get("title", ""),
+                "Location": j.get("location_remote") or j.get("location", ""),
+                "Application URL": j.get("url", ""),
+                "Score (%)": j.get("score", ""),
+                "Stack": j.get("stack", ""),
+                "Region": j.get("region", ""),
+                "Reason": j.get("reason", ""),
+                "Worth Applying": "Yes" if worth else ("No" if worth is False else ""),
+            })
+
+    print(f"Exported {len(filtered)} jobs → {out_path}")
+    if min_score:
+        print(f"Filter: score >= {min_score} (skipped {len(jobs) - len(filtered)})")
+
+
 def main() -> None:
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__)
@@ -92,8 +141,18 @@ def main() -> None:
         from drafter import draft_application
         draft_application(config, sys.argv[2])
 
+    elif cmd == "export":
+        min_score = 0
+        if "--min" in sys.argv:
+            idx = sys.argv.index("--min")
+            try:
+                min_score = int(sys.argv[idx + 1])
+            except (IndexError, ValueError):
+                sys.exit("Usage: python main.py export --min 60")
+        export_jobs(min_score)
+
     else:
-        sys.exit(f"Unknown command: {cmd}\nUse: scan | draft")
+        sys.exit(f"Unknown command: {cmd}\nUse: scan | draft | export")
 
 
 if __name__ == "__main__":
