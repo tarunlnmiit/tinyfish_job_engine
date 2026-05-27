@@ -12,6 +12,7 @@ from llm_utils import chat_with_fallback
 
 STATE_FILE = Path("state/seen_jobs.json")
 LAST_SCAN_FILE = Path("state/last_scan.json")
+JOB_HISTORY_FILE = Path("state/job_history.json")
 # RESUME_FILE is now loaded from config in run_scan
 
 # Matches individual job postings by URL pattern
@@ -340,8 +341,24 @@ def run_scan(config: dict, companies: list[dict]) -> None:
     top_jobs = sorted([j for j in all_scored_jobs if j.get("score", 0) >= min_score],
                       key=lambda x: x.get("score", 0), reverse=True)[:top_n]
 
+    scan_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for job in all_scored_jobs:
+        job["scan_date"] = scan_date
+
     LAST_SCAN_FILE.parent.mkdir(exist_ok=True)
     LAST_SCAN_FILE.write_text(json.dumps(all_scored_jobs, indent=2))
+
+    # Append new jobs to history (deduplicate by url)
+    history: list[dict] = []
+    if JOB_HISTORY_FILE.exists():
+        try:
+            history = json.loads(JOB_HISTORY_FILE.read_text())
+        except Exception:
+            history = []
+    existing_urls = {j["url"] for j in history}
+    new_entries = [j for j in all_scored_jobs if j["url"] not in existing_urls]
+    history.extend(new_entries)
+    JOB_HISTORY_FILE.write_text(json.dumps(history, indent=2))
 
     date_str = datetime.now().strftime("%d %b %Y")
     tg = config.get("telegram", {})

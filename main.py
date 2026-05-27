@@ -6,12 +6,14 @@ Usage:
   python main.py draft https://... — draft application for a specific URL
   python main.py export            — export last scan to CSV (output/jobs_YYYY-MM-DD.csv)
   python main.py export --min 60   — export only jobs with score >= 60
+  python main.py export --days 7   — export jobs from last 7 days (requires scan history)
+  python main.py export --days 7 --min 60  — combine filters
 """
 import csv
 import json
 import os
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -79,46 +81,64 @@ def load_companies() -> list:
 
 
 LAST_SCAN_FILE = Path("state/last_scan.json")
+JOB_HISTORY_FILE = Path("state/job_history.json")
 
 EXPORT_FIELDS = [
     "Company", "Role", "Location", "Application URL",
-    "Score (%)", "Stack", "Region", "Reason", "Worth Applying",
+    "Score (%)", "Stack", "Region", "Reason", "Worth Applying", "Scan Date",
 ]
 
 
-def export_jobs(min_score: int = 0) -> None:
-    if not LAST_SCAN_FILE.exists():
-        sys.exit("No scan found. Run: python main.py scan")
+def _job_to_row(j: dict) -> dict:
+    worth = j.get("worth_applying")
+    return {
+        "Company": j.get("company", ""),
+        "Role": j.get("extracted_title") or j.get("title", ""),
+        "Location": j.get("location_remote") or j.get("location", ""),
+        "Application URL": j.get("url", ""),
+        "Score (%)": j.get("score", ""),
+        "Stack": j.get("stack", ""),
+        "Region": j.get("region", ""),
+        "Reason": j.get("reason", ""),
+        "Worth Applying": "Yes" if worth else ("No" if worth is False else ""),
+        "Scan Date": j.get("scan_date", ""),
+    }
 
-    jobs: list[dict] = json.loads(LAST_SCAN_FILE.read_text())
+
+def export_jobs(min_score: int = 0, days: int = 0) -> None:
+    if days > 0:
+        if not JOB_HISTORY_FILE.exists():
+            sys.exit(
+                "No history yet. Run 'python main.py scan' at least once after this update."
+            )
+        all_jobs: list[dict] = json.loads(JOB_HISTORY_FILE.read_text())
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
+        jobs = [j for j in all_jobs if j.get("scan_date", "9999") >= cutoff]
+        source_label = f"last {days} days"
+    else:
+        if not LAST_SCAN_FILE.exists():
+            sys.exit("No scan found. Run: python main.py scan")
+        jobs = json.loads(LAST_SCAN_FILE.read_text())
+        source_label = "last scan"
+
     filtered = [j for j in jobs if j.get("score", 0) >= min_score]
 
     if not filtered:
-        print(f"No jobs with score >= {min_score}")
+        print(f"No jobs with score >= {min_score} in {source_label}")
         return
 
     date_str = datetime.now().strftime("%Y-%m-%d")
-    out_path = Path("output") / f"jobs_{date_str}.csv"
+    suffix = f"_last{days}d" if days else ""
+    out_path = Path("output") / f"jobs_{date_str}{suffix}.csv"
     out_path.parent.mkdir(exist_ok=True)
 
     with out_path.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=EXPORT_FIELDS)
         writer.writeheader()
         for j in filtered:
-            worth = j.get("worth_applying")
-            writer.writerow({
-                "Company": j.get("company", ""),
-                "Role": j.get("extracted_title") or j.get("title", ""),
-                "Location": j.get("location_remote") or j.get("location", ""),
-                "Application URL": j.get("url", ""),
-                "Score (%)": j.get("score", ""),
-                "Stack": j.get("stack", ""),
-                "Region": j.get("region", ""),
-                "Reason": j.get("reason", ""),
-                "Worth Applying": "Yes" if worth else ("No" if worth is False else ""),
-            })
+            writer.writerow(_job_to_row(j))
 
-    print(f"Exported {len(filtered)} jobs → {out_path}")
+    print(f"Exported {len(filtered)} jobs ({source_label}) → {out_path}")
     if min_score:
         print(f"Filter: score >= {min_score} (skipped {len(jobs) - len(filtered)})")
 
@@ -143,13 +163,20 @@ def main() -> None:
 
     elif cmd == "export":
         min_score = 0
+        days = 0
         if "--min" in sys.argv:
             idx = sys.argv.index("--min")
             try:
                 min_score = int(sys.argv[idx + 1])
             except (IndexError, ValueError):
-                sys.exit("Usage: python main.py export --min 60")
-        export_jobs(min_score)
+                sys.exit("--min requires an integer, e.g. --min 60")
+        if "--days" in sys.argv:
+            idx = sys.argv.index("--days")
+            try:
+                days = int(sys.argv[idx + 1])
+            except (IndexError, ValueError):
+                sys.exit("--days requires an integer, e.g. --days 7")
+        export_jobs(min_score=min_score, days=days)
 
     else:
         sys.exit(f"Unknown command: {cmd}\nUse: scan | draft | export")
