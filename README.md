@@ -56,3 +56,8 @@ MIT License.
 
 ---
 *Built with ❤️ for the modern job seeker.*
+
+
+---
+
+*I turn scattered AI capabilities into tools people can actually run. · Available for AI contract work → [github.com/tarunlnmiit](https://github.com/tarunlnmiit)*
